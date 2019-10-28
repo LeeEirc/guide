@@ -69,7 +69,9 @@ row before the </tbody></table> line.
 - [Performance](#performance)
   - [Prefer strconv over fmt](#prefer-strconv-over-fmt)
   - [Avoid string-to-byte conversion](#avoid-string-to-byte-conversion)
+  - [Prefer Specifying Map Capacity Hints](#prefer-specifying-map-capacity-hints)
 - [Style](#style)
+  - [Be Consistent](#be-consistent)
   - [Group Similar Declarations](#group-similar-declarations)
   - [Import Group Ordering](#import-group-ordering)
   - [Package Names](#package-names)
@@ -81,13 +83,14 @@ row before the </tbody></table> line.
   - [Top-level Variable Declarations](#top-level-variable-declarations)
   - [Prefix Unexported Globals with _](#prefix-unexported-globals-with-_)
   - [Embedding in Structs](#embedding-in-structs)
-  - [Use Field Names to initialize Structs](#use-field-names-to-initialize-structs)
+  - [Use Field Names to Initialize Structs](#use-field-names-to-initialize-structs)
   - [Local Variable Declarations](#local-variable-declarations)
   - [nil is a valid slice](#nil-is-a-valid-slice)
   - [Reduce Scope of Variables](#reduce-scope-of-variables)
   - [Avoid Naked Parameters](#avoid-naked-parameters)
   - [Use Raw String Literals to Avoid Escaping](#use-raw-string-literals-to-avoid-escaping)
   - [Initializing Struct References](#initializing-struct-references)
+  - [Initializing Maps](#initializing-maps)
   - [Format Strings outside Printf](#format-strings-outside-printf)
   - [Naming Printf-style Functions](#naming-printf-style-functions)
 - [Patterns](#patterns)
@@ -170,7 +173,7 @@ sVals := map[int]S{1: {"A"}}
 sVals[1].Read()
 
 // This will not compile:
-//  sVals[0].Write("test")
+//  sVals[1].Write("test")
 
 sPtrs := map[int]*S{1: {"A"}}
 
@@ -238,15 +241,10 @@ mu.Lock()
 </td></tr>
 </tbody></table>
 
-```go
-var mu sync.Mutex
+If you use a struct by pointer, then the mutex can be a non-pointer field.
 
-mu.Lock()
-defer mu.Unlock()
-```
-
-If you use a struct by pointer, then the mutex can be a non-pointer field or,
-preferably, embedded directly into the struct.
+Unexported structs that use a mutex to protect fields of the struct may embed
+the mutex.
 
 <table>
 <tbody>
@@ -254,7 +252,7 @@ preferably, embedded directly into the struct.
 
 ```go
 type smap struct {
-  sync.Mutex
+  sync.Mutex // only for unexported types
 
   data map[string]string
 }
@@ -301,7 +299,7 @@ func (m *SMap) Get(k string) string {
 </tr>
 <tr>
 <td>Embed for private types or types that need to implement the Mutex interface.</td>
-<td>For exported types, use a private lock.</td>
+<td>For exported types, use a private field.</td>
 </tr>
 
 </tbody></table>
@@ -368,20 +366,20 @@ state.
 
 ```go
 type Stats struct {
-  sync.Mutex
-
+  mu sync.Mutex
   counters map[string]int
 }
 
 // Snapshot returns the current stats.
 func (s *Stats) Snapshot() map[string]int {
-  s.Lock()
-  defer s.Unlock()
+  s.mu.Lock()
+  defer s.mu.Unlock()
 
   return s.counters
 }
 
-// snapshot is no longer protected by the lock!
+// snapshot is no longer protected by the mutex, so any
+// access to the snapshot is subject to data races.
 snapshot := stats.Snapshot()
 ```
 
@@ -389,14 +387,13 @@ snapshot := stats.Snapshot()
 
 ```go
 type Stats struct {
-  sync.Mutex
-
+  mu sync.Mutex
   counters map[string]int
 }
 
 func (s *Stats) Snapshot() map[string]int {
-  s.Lock()
-  defer s.Unlock()
+  s.mu.Lock()
+  defer s.mu.Unlock()
 
   result := make(map[string]int, len(s.counters))
   for k, v := range s.counters {
@@ -464,7 +461,7 @@ accesses, where the other computations are more significant than the `defer`.
 
 ### Channel Size is One or None
 
-Channels should usually have a size of one or be unbuffered. By default, 
+Channels should usually have a size of one or be unbuffered. By default,
 channels are unbuffered and have a size of zero. Any other size
 must be subject to a high level of scrutiny. Consider how the size is
 determined, what prevents the channel from filling up under load and blocking
@@ -729,8 +726,53 @@ There are three main options for propagating errors if a call fails:
   specific error case.
 
 It is recommended to add context where possible so that instead of a vague
-error such as "connection refused", you get more useful errors such as "failed to
-call service foo: connection refused".
+error such as "connection refused", you get more useful errors such as
+"call service foo: connection refused".
+
+When adding context to returned errors, keep the context succinct by avoiding
+phrases like "failed to", which state the obvious and pile up as the error
+percolates up through the stack:
+
+<table>
+<thead><tr><th>Bad</th><th>Good</th></tr></thead>
+<tbody>
+<tr><td>
+
+```go
+s, err := store.New()
+if err != nil {
+    return fmt.Errorf(
+        "failed to create new store: %s", err)
+}
+```
+
+</td><td>
+
+```go
+s, err := store.New()
+if err != nil {
+    return fmt.Errorf(
+        "new store: %s", err)
+}
+```
+
+<tr><td>
+
+```
+failed to x: failed to y: failed to create new store: the error
+```
+
+</td><td>
+
+```
+x: y: new store: the error
+```
+
+</td></tr>
+</tbody></table>
+
+However once the error is sent to another system, it should be clear the
+message is an error (e.g. an `err` tag or "Failed" prefix in logs).
 
 See also [Don't just check errors, handle them gracefully].
 
@@ -802,7 +844,7 @@ func main() {
 
 ```go
 func foo(bar string) error {
-  if len(bar) == 0
+  if len(bar) == 0 {
     return errors.New("bar must not be empty")
   }
   // ...
@@ -938,15 +980,30 @@ When converting primitives to/from strings, `strconv` is faster than
 <tr><td>
 
 ```go
-var i int = ...
-s := fmt.Sprint(i)
+for i := 0; i < b.N; i++ {
+  s := fmt.Sprint(rand.Int())
+}
 ```
 
 </td><td>
 
 ```go
-var i int = ...
-s := strconv.Itoa(i)
+for i := 0; i < b.N; i++ {
+  s := strconv.Itoa(rand.Int())
+}
+```
+
+</td></tr>
+<tr><td>
+
+```
+BenchmarkFmtSprint-4    143 ns/op    2 allocs/op
+```
+
+</td><td>
+
+```
+BenchmarkStrconv-4    64.2 ns/op    1 allocs/op
 ```
 
 </td></tr>
@@ -993,7 +1050,82 @@ BenchmarkGood-4  500000000   3.25 ns/op
 </td></tr>
 </tbody></table>
 
+### Prefer Specifying Map Capacity Hints
+
+Where possible, provide capacity hints when initializing
+maps with `make()`.
+
+```go
+make(map[T1]T2, hint)
+```
+
+Providing a capacity hint to `make()` tries to right-size the
+map at initialization time, which reduces the need for growing
+the map and allocations as elements are added to the map. Note
+that the capacity hint is not guaranteed for maps, so adding
+elements may still allocate even if a capacity hint is provided.
+
+<table>
+<thead><tr><th>Bad</th><th>Good</th></tr></thead>
+<tbody>
+<tr><td>
+
+```go
+m := make(map[string]os.FileInfo)
+
+files, _ := ioutil.ReadDir("./files")
+for _, f := range files {
+    m[f.Name()] = f
+}
+```
+
+</td><td>
+
+```go
+
+files, _ := ioutil.ReadDir("./files")
+
+m := make(map[string]os.FileInfo, len(files))
+for _, f := range files {
+    m[f.Name()] = f
+}
+```
+
+</td></tr>
+<tr><td>
+
+`m` is created without a size hint; there may be more
+allocations at assignment time.
+
+</td><td>
+
+`m` is created with a size hint; there may be fewer
+allocations at assignment time.
+
+</td></tr>
+</tbody></table>
+
 ## Style
+
+### Be Consistent
+
+Some of the guidelines outlined in this document can be evaluated objectively;
+others are situational, contextual, or subjective.
+
+Above all else, **be consistent**.
+
+Consistent code is easier to maintain, is easier to rationalize, requires less
+cognitive overhead, and is easier to migrate or update as new conventions emerge
+or classes of bugs are fixed.
+
+Conversely, having multiple disparate or conflicting styles within a single
+codebase causes maintenance overhead, uncertainty, and cognitive dissonance,
+all of which can directly contribute to lower velocity, painful code reviews,
+and bugs.
+
+When applying these guidelines to a codebase, it is recommended that changes
+are made at a package (or larger) level: application at at a sub-package level
+violates the above concern by introducing multiple styles into the same code.
 
 ### Group Similar Declarations
 
@@ -1176,11 +1308,11 @@ import (
 
 ### Package Names
 
-When naming packages, choose a name that is,
+When naming packages, choose a name that is:
 
 - All lower-case. No capitals or underscores.
 - Does not need to be renamed using named imports at most call sites.
-- Short and succint. Remember that the name is identified in full at every call
+- Short and succinct. Remember that the name is identified in full at every call
   site.
 - Not plural. For example, `net/url`, not `net/urls`.
 - Not "common", "util", "shared", or "lib". These are bad, uninformative names.
@@ -1272,7 +1404,7 @@ func (s *something) Cost() {
 
 type something struct{ ... }
 
-func calcCost(n int[]) int {...}
+func calcCost(n []int) int {...}
 
 func (s *something) Stop() {...}
 
@@ -1296,7 +1428,7 @@ func (s *something) Cost() {
 
 func (s *something) Stop() {...}
 
-func calcCost(n int[]) int {...}
+func calcCost(n []int) int {...}
 ```
 
 </td></tr>
@@ -1336,7 +1468,7 @@ for _, v := range data {
     log.Printf("Invalid v: %v", v)
     continue
   }
-  
+
   v = process(v)
   if err := v.Call(); err != nil {
     return err
@@ -1503,7 +1635,7 @@ type Client struct {
 </td></tr>
 </tbody></table>
 
-### Use Field Names to initialize Structs
+### Use Field Names to Initialize Structs
 
 You should almost always specify field names when initializing structs. This is
 now enforced by [`go vet`].
@@ -1537,7 +1669,6 @@ fewer fields.
 
 ```go
 tests := []struct{
-}{
   op Operation
   want string
 }{
@@ -1570,7 +1701,7 @@ s := "foo"
 </tbody></table>
 
 However, there are cases where the default value is clearer when the `var`
-keyword is use. [Declaring Empty Slices], for example.
+keyword is used. [Declaring Empty Slices], for example.
 
   [Declaring Empty Slices]: https://github.com/golang/go/wiki/CodeReviewComments#declaring-empty-slices
 
@@ -1709,7 +1840,7 @@ conflicts with [Reduce Nesting](#reduce-nesting).
 <tr><td>
 
 ```go
-err := f.Close()
+err := ioutil.WriteFile(name, data, 0644)
 if err != nil {
  return err
 }
@@ -1718,7 +1849,7 @@ if err != nil {
 </td><td>
 
 ```go
-if err := f.Close(); err != nil {
+if err := ioutil.WriteFile(name, data, 0644); err != nil {
  return err
 }
 ```
@@ -1735,12 +1866,14 @@ try to reduce the scope.
 <tr><td>
 
 ```go
-if f, err := os.Open("f"); err == nil {
-  _, err = io.WriteString(f, "data")
+if data, err := ioutil.ReadFile(name); err == nil {
+  err = cfg.Decode(data)
   if err != nil {
     return err
   }
-  return f.Close()
+
+  fmt.Println(cfg)
+  return nil
 } else {
   return err
 }
@@ -1749,16 +1882,17 @@ if f, err := os.Open("f"); err == nil {
 </td><td>
 
 ```go
-f, err := os.Open("f")
+data, err := ioutil.ReadFile(name)
 if err != nil {
    return err
 }
 
-if _, err := io.WriteString(f, "data"); err != nil {
+if err := cfg.Decode(data); err != nil {
   return err
 }
 
-return f.Close()
+fmt.Println(cfg)
+return nil
 ```
 
 </td></tr>
@@ -1867,6 +2001,88 @@ sptr := &T{Name: "bar"}
 </td></tr>
 </tbody></table>
 
+### Initializing Maps
+
+Prefer `make(..)` for empty maps, and maps populated
+programmatically. This makes map initialization visually
+distinct from declaration, and it makes it easy to add size
+hints later if available.
+
+<table>
+<thead><tr><th>Bad</th><th>Good</th></tr></thead>
+<tbody>
+<tr><td>
+
+```go
+var (
+  // m1 is safe to read and write;
+  // m2 will panic on writes.
+  m1 = map[T1]T2{}
+  m2 map[T1]T2
+)
+```
+
+</td><td>
+
+```go
+var (
+  // m1 is safe to read and write;
+  // m2 will panic on writes.
+  m1 = make(map[T1]T2)
+  m2 map[T1]T2
+)
+```
+
+</td></tr>
+<tr><td>
+
+Declaration and initialization are visually similar.
+
+</td><td>
+
+Declaration and initialization are visually distinct.
+
+</td></tr>
+</tbody></table>
+
+Where possible, provide capacity hints when initializing
+maps with `make()`. See
+[Prefer Specifying Map Capacity Hints](#prefer-specifying-map-capacity-hints)
+for more information.
+
+On the other hand, if the map holds a fixed list of elements,
+use map literals to initialize the map.
+
+<table>
+<thead><tr><th>Bad</th><th>Good</th></tr></thead>
+<tbody>
+<tr><td>
+
+```go
+m := make(map[T1]T2, 3)
+m[k1] = v1
+m[k2] = v2
+m[k3] = v3
+```
+
+</td><td>
+
+```go
+m := map[T1]T2{
+  k1: v1,
+  k2: v2,
+  k3: v3,
+}
+```
+
+</td></tr>
+</tbody></table>
+
+
+The basic rule of thumb is to use map literals when adding a fixed set of
+elements at initialization time, otherwise use `make` (and specify a size hint
+if available).
+
 ### Format Strings outside Printf
 
 If you declare format strings for `Printf`-style functions outside a string
@@ -1899,13 +2115,13 @@ fmt.Printf(msg, 1, 2)
 When you declare a `Printf`-style function, make sure that `go vet` can detect
 it and check the format string.
 
-This means that you should use pre-defined `Printf`-style function
+This means that you should use predefined `Printf`-style function
 names if possible. `go vet` will check these by default. See [Printf family]
 for more information.
 
   [Printf family]: https://golang.org/cmd/vet/#hdr-Printf_family
 
-If using the pre-defined names is not an option, end the name you choose with
+If using the predefined names is not an option, end the name you choose with
 f: `Wrapf`, not `Wrap`. `go vet` can be asked to check specific `Printf`-style
 names but they must end with f.
 
@@ -2099,7 +2315,7 @@ func Connect(
   }
 
   for _, o := range opts {
-    o(&options)
+    o.apply(&options)
   }
 
   // ...
